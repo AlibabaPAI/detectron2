@@ -275,10 +275,8 @@ class Boxes:
         self.tensor[:, 0::2] *= scale_x
         self.tensor[:, 1::2] *= scale_y
 
-    # classmethod not supported by torchscript. TODO try staticmethod
     @classmethod
-    @torch.jit.unused
-    def cat(cls, boxes_list):
+    def cat(cls, boxes_list: List["Boxes"]) -> "Boxes":
         """
         Concatenates a list of Boxes into a single Boxes
 
@@ -288,6 +286,10 @@ class Boxes:
         Returns:
             Boxes: the concatenated Boxes
         """
+        # Currently we do not support `RotatedBoxes` to be exported to torchscript.
+        if torch.jit.is_scripting():
+            cls = Boxes
+
         assert isinstance(boxes_list, (list, tuple))
         if len(boxes_list) == 0:
             return cls(torch.empty(0))

@@ -2,7 +2,7 @@
 import inspect
 import logging
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 import torch
 from torch import nn
 
@@ -43,6 +43,7 @@ def build_roi_heads(cfg, input_shape):
     return ROI_HEADS_REGISTRY.get(name)(cfg, input_shape)
 
 
+@torch.jit.unused
 def select_foreground_proposals(
     proposals: List[Instances], bg_label: int
 ) -> Tuple[List[Instances], List[torch.Tensor]]:
@@ -75,6 +76,7 @@ def select_foreground_proposals(
     return fg_proposals, fg_selection_masks
 
 
+@torch.jit.unused
 def select_proposals_with_visible_keypoints(proposals: List[Instances]) -> List[Instances]:
     """
     Args:
@@ -217,6 +219,7 @@ class ROIHeads(torch.nn.Module):
         return sampled_idxs, gt_classes[sampled_idxs]
 
     @torch.no_grad()
+    @torch.jit.unused
     def label_and_sample_proposals(
         self, proposals: List[Instances], targets: List[Instances]
     ) -> List[Instances]:
@@ -527,16 +530,13 @@ class StandardROIHeads(ROIHeads):
         self.box_head = box_head
         self.box_predictor = box_predictor
 
-        self.mask_on = mask_in_features is not None
-        if self.mask_on:
-            self.mask_in_features = mask_in_features
-            self.mask_pooler = mask_pooler
-            self.mask_head = mask_head
-        self.keypoint_on = keypoint_in_features is not None
-        if self.keypoint_on:
-            self.keypoint_in_features = keypoint_in_features
-            self.keypoint_pooler = keypoint_pooler
-            self.keypoint_head = keypoint_head
+        self.mask_in_features = mask_in_features
+        self.mask_pooler = mask_pooler
+        self.mask_head = mask_head
+
+        self.keypoint_in_features = keypoint_in_features
+        self.keypoint_pooler = keypoint_pooler
+        self.keypoint_head = keypoint_head
 
         self.train_on_pred_boxes = train_on_pred_boxes
 
@@ -658,11 +658,11 @@ class StandardROIHeads(ROIHeads):
         """
         del images
         if self.training:
-            assert targets
+            assert targets is not None
             proposals = self.label_and_sample_proposals(proposals, targets)
         del targets
 
-        if self.training:
+        if self.training and not torch.jit.is_scripting():
             losses = self._forward_box(features, proposals)
             # Usually the original proposals used by the box head are used by the mask, keypoint
             # heads. But when `self.train_on_pred_boxes is True`, proposals will contain boxes
@@ -701,12 +701,17 @@ class StandardROIHeads(ROIHeads):
         assert instances[0].has("pred_boxes") and instances[0].has("pred_classes")
 
         instances = self._forward_mask(features, instances)
+        # type refinement to convert type Any to List[Instances]
+        if torch.jit.is_scripting():
+            assert isinstance(instances, List[Instances])
+
         instances = self._forward_keypoint(features, instances)
+
+        if torch.jit.is_scripting():
+            assert isinstance(instances, List[Instances])
         return instances
 
-    def _forward_box(
-        self, features: Dict[str, torch.Tensor], proposals: List[Instances]
-    ) -> Union[Dict[str, torch.Tensor], List[Instances]]:
+    def _forward_box(self, features: Dict[str, torch.Tensor], proposals: List[Instances]):
         """
         Forward logic of the box prediction branch. If `self.train_on_pred_boxes is True`,
             the function puts predicted boxes in the `proposal_boxes` field of `proposals` argument.
@@ -729,7 +734,7 @@ class StandardROIHeads(ROIHeads):
         predictions = self.box_predictor(box_features)
         del box_features
 
-        if self.training:
+        if self.training and not torch.jit.is_scripting():
             losses = self.box_predictor.losses(predictions, proposals)
             # proposals is modified in-place below, so losses must be computed first.
             if self.train_on_pred_boxes:
@@ -744,9 +749,7 @@ class StandardROIHeads(ROIHeads):
             pred_instances, _ = self.box_predictor.inference(predictions, proposals)
             return pred_instances
 
-    def _forward_mask(
-        self, features: Dict[str, torch.Tensor], instances: List[Instances]
-    ) -> Union[Dict[str, torch.Tensor], List[Instances]]:
+    def _forward_mask(self, features: Dict[str, torch.Tensor], instances: List[Instances]) -> Any:
         """
         Forward logic of the mask prediction branch.
 
@@ -761,25 +764,36 @@ class StandardROIHeads(ROIHeads):
             In training, a dict of losses.
             In inference, update `instances` with new fields "pred_masks" and return it.
         """
-        if not self.mask_on:
-            return {} if self.training else instances
+        # return type Any does not work for ternary operators
+        # https://github.com/pytorch/pytorch/issues/43942
+        if self.mask_in_features is None:
+            if self.training:
+                return {}
+            else:
+                return instances
 
-        features = [features[f] for f in self.mask_in_features]
+        # Make None checks in if conditional to make torchscript conditionally compile each branch.
+        if (
+            self.mask_in_features is not None
+            and self.mask_pooler is not None
+            and self.mask_head is not None
+        ):
+            features = [features[f] for f in self.mask_in_features]
 
-        if self.training:
-            # The loss is only defined on positive proposals.
-            proposals, _ = select_foreground_proposals(instances, self.num_classes)
-            proposal_boxes = [x.proposal_boxes for x in proposals]
-            mask_features = self.mask_pooler(features, proposal_boxes)
-            return self.mask_head(mask_features, proposals)
-        else:
-            pred_boxes = [x.pred_boxes for x in instances]
-            mask_features = self.mask_pooler(features, pred_boxes)
-            return self.mask_head(mask_features, instances)
+            if self.training:
+                # The loss is only defined on positive proposals.
+                proposals, _ = select_foreground_proposals(instances, self.num_classes)
+                proposal_boxes = [x.proposal_boxes for x in proposals]
+                mask_features = self.mask_pooler(features, proposal_boxes)
+                return self.mask_head(mask_features, proposals)
+            else:
+                pred_boxes = [x.pred_boxes for x in instances]
+                mask_features = self.mask_pooler(features, pred_boxes)
+                return self.mask_head(mask_features, instances)
 
     def _forward_keypoint(
         self, features: Dict[str, torch.Tensor], instances: List[Instances]
-    ) -> Union[Dict[str, torch.Tensor], List[Instances]]:
+    ) -> Any:
         """
         Forward logic of the keypoint prediction branch.
 
@@ -794,20 +808,31 @@ class StandardROIHeads(ROIHeads):
             In training, a dict of losses.
             In inference, update `instances` with new fields "pred_keypoints" and return it.
         """
-        if not self.keypoint_on:
-            return {} if self.training else instances
+        # return type Any does not work for ternary operators
+        # https://github.com/pytorch/pytorch/issues/43942
+        if self.keypoint_in_features is None:
+            if self.training:
+                return {}
+            else:
+                return instances
 
-        features = [features[f] for f in self.keypoint_in_features]
+        # Make None checks in if conditional to make torchscript conditionally compile each branch.
+        if (
+            self.keypoint_in_features is not None
+            and self.keypoint_pooler is not None
+            and self.keypoint_head is not None
+        ):
+            features = [features[f] for f in self.keypoint_in_features]
 
-        if self.training:
-            # The loss is defined on positive proposals with >=1 visible keypoints.
-            proposals, _ = select_foreground_proposals(instances, self.num_classes)
-            proposals = select_proposals_with_visible_keypoints(proposals)
-            proposal_boxes = [x.proposal_boxes for x in proposals]
+            if self.training:
+                # The loss is defined on positive proposals with >=1 visible keypoints.
+                proposals, _ = select_foreground_proposals(instances, self.num_classes)
+                proposals = select_proposals_with_visible_keypoints(proposals)
+                proposal_boxes = [x.proposal_boxes for x in proposals]
 
-            keypoint_features = self.keypoint_pooler(features, proposal_boxes)
-            return self.keypoint_head(keypoint_features, proposals)
-        else:
-            pred_boxes = [x.pred_boxes for x in instances]
-            keypoint_features = self.keypoint_pooler(features, pred_boxes)
-            return self.keypoint_head(keypoint_features, instances)
+                keypoint_features = self.keypoint_pooler(features, proposal_boxes)
+                return self.keypoint_head(keypoint_features, proposals)
+            else:
+                pred_boxes = [x.pred_boxes for x in instances]
+                keypoint_features = self.keypoint_pooler(features, pred_boxes)
+                return self.keypoint_head(keypoint_features, instances)

@@ -37,6 +37,7 @@ def build_keypoint_head(cfg, input_shape):
     return ROI_KEYPOINT_HEAD_REGISTRY.get(name)(cfg, input_shape)
 
 
+@torch.jit.unused
 def keypoint_rcnn_loss(pred_keypoint_logits, instances, normalizer):
     """
     Arguments:
@@ -96,7 +97,7 @@ def keypoint_rcnn_loss(pred_keypoint_logits, instances, normalizer):
     return keypoint_loss
 
 
-def keypoint_rcnn_inference(pred_keypoint_logits, pred_instances):
+def keypoint_rcnn_inference(pred_keypoint_logits, pred_instances: List[Instances]):
     """
     Post process each predicted keypoint heatmap in `pred_keypoint_logits` into (x, y, score)
         and add it to the `pred_instances` as a `pred_keypoints` field.
@@ -120,7 +121,14 @@ def keypoint_rcnn_inference(pred_keypoint_logits, pred_instances):
     pred_keypoint_logits = pred_keypoint_logits.detach()
     keypoint_results = heatmaps_to_keypoints(pred_keypoint_logits, bboxes_flat.detach())
     num_instances_per_image = [len(i) for i in pred_instances]
-    keypoint_results = keypoint_results[:, :, [0, 1, 3]].split(num_instances_per_image, dim=0)
+    # slicing multiple dimensions with sequences is not supported by torchscript
+    # https://github.com/pytorch/pytorch/issues/43943
+    keypoint_results = (
+        keypoint_results[:, :]
+        .index_select(2, torch.tensor([0, 1, 3]))
+        .split(num_instances_per_image, dim=0)
+    )
+
     heatmap_results = pred_keypoint_logits.split(num_instances_per_image, dim=0)
 
     for keypoint_results_per_image, heatmap_results_per_image, instances_per_image in zip(
@@ -132,7 +140,7 @@ def keypoint_rcnn_inference(pred_keypoint_logits, pred_instances):
         instances_per_image.pred_keypoint_heatmaps = heatmap_results_per_image
 
 
-class BaseKeypointRCNNHead(nn.Module):
+class BaseKeypointRCNNHead(nn.Sequential):
     """
     Implement the basic Keypoint R-CNN losses and inference logic described in
     Sec. 5 of :paper:`Mask R-CNN`.
@@ -191,7 +199,7 @@ class BaseKeypointRCNNHead(nn.Module):
             A dict of losses if in training. The predicted "instances" if in inference.
         """
         x = self.layers(x)
-        if self.training:
+        if self.training and not torch.jit.is_scripting():
             num_images = len(instances)
             normalizer = (
                 None if self.loss_normalizer == "visible" else num_images * self.loss_normalizer
@@ -232,14 +240,13 @@ class KRCNNConvDeconvUpsampleHead(BaseKeypointRCNNHead):
         super().__init__(num_keypoints=num_keypoints, **kwargs)
 
         # default up_scale to 2 (this can be made an option)
-        up_scale = 2
+        up_scale = 2.0
         in_channels = input_shape.channels
 
-        self.blocks = []
         for idx, layer_channels in enumerate(conv_dims, 1):
             module = Conv2d(in_channels, layer_channels, 3, stride=1, padding=1)
             self.add_module("conv_fcn{}".format(idx), module)
-            self.blocks.append(module)
+            self.add_module("conv_fcn_relu{}".format(idx), nn.ReLU())
             in_channels = layer_channels
 
         deconv_kernel = 4
@@ -264,8 +271,7 @@ class KRCNNConvDeconvUpsampleHead(BaseKeypointRCNNHead):
         return ret
 
     def layers(self, x):
-        for layer in self.blocks:
-            x = F.relu(layer(x))
-        x = self.score_lowres(x)
+        for layer in self:
+            x = layer(x)
         x = interpolate(x, scale_factor=self.up_scale, mode="bilinear", align_corners=False)
         return x

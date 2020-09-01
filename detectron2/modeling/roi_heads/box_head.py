@@ -2,7 +2,6 @@
 import numpy as np
 from typing import List
 import fvcore.nn.weight_init as weight_init
-import torch
 from torch import nn
 from torch.nn import functional as F
 
@@ -19,9 +18,15 @@ Registry for box heads, which make box predictions from per-region features.
 The registered object will be called with `obj(cfg, input_shape)`.
 """
 
+# To get torchscript support, we make box/mask/keypoint head classes a subclass of `nn.Sequential`.
+# If you want to add new layers in these head classes, please make sure they are added to the class
+# in the order of that in the network.
+# todo: revert to nn.Module when torchscript support List[nn.Module]
+# https://github.com/pytorch/pytorch/pull/38059
+
 
 @ROI_BOX_HEAD_REGISTRY.register()
-class FastRCNNConvFCHead(nn.Module):
+class FastRCNNConvFCHead(nn.Sequential):
     """
     A head with several 3x3 conv layers (each followed by norm & relu) and then
     several fc layers (each followed by relu).
@@ -63,8 +68,11 @@ class FastRCNNConvFCHead(nn.Module):
 
         self.fcs = []
         for k, fc_dim in enumerate(fc_dims):
-            fc = Linear(np.prod(self._output_size), fc_dim)
+            if k == 0:
+                self.add_module("flatten", nn.Flatten())
+            fc = Linear(int(np.prod(self._output_size)), fc_dim)
             self.add_module("fc{}".format(k + 1), fc)
+            self.add_module("fc_relu{}".format(k + 1), nn.ReLU())
             self.fcs.append(fc)
             self._output_size = fc_dim
 
@@ -85,16 +93,6 @@ class FastRCNNConvFCHead(nn.Module):
             "fc_dims": [fc_dim] * num_fc,
             "conv_norm": cfg.MODEL.ROI_BOX_HEAD.NORM,
         }
-
-    def forward(self, x):
-        for layer in self.conv_norm_relus:
-            x = layer(x)
-        if len(self.fcs):
-            if x.dim() > 2:
-                x = torch.flatten(x, start_dim=1)
-            for layer in self.fcs:
-                x = F.relu(layer(x))
-        return x
 
     @property
     def output_shape(self):

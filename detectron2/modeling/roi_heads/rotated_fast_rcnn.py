@@ -178,7 +178,7 @@ class RROIHeads(StandardROIHeads):
         """
         super().__init__(**kwargs)
         assert (
-            not self.mask_on and not self.keypoint_on
+            not self.mask_in_features and not self.keypoint_in_features
         ), "Mask/Keypoints not supported in Rotated ROIHeads."
         assert not self.train_on_pred_boxes, "train_on_pred_boxes not implemented for RROIHeads!"
 
